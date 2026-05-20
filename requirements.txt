@@ -3,3 +3,5 @@ opencv-python>=4.8
 numpy>=1.24
 mediapipe>=0.10
 onnxruntime>=1.16
+cryptography>=48.0.0
+requests>= 2.34.1

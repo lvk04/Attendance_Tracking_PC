@@ -14,7 +14,7 @@ from datetime import datetime
 class ArcFaceRecognizer:
     """Face recognition using ArcFace ONNX model."""
 
-    def __init__(self, model_path="arcface.onnx"):
+    def __init__(self, model_path="MobileFaceNet.onnx"):
         current_dir = os.path.dirname(os.path.abspath(__file__))
         full_path = os.path.join(current_dir, model_path)
 

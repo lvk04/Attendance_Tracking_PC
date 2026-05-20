@@ -440,8 +440,9 @@ if __name__ == "__main__":
     _syncer = AttendanceSyncer(
         db_path       = ATTENDANCE_DB,
         faces_db_path = FACES_DB,
-        gateway_url   = "http://127.0.0.1:5100",  # ← all traffic through gateway
+        gateway_url   = "https://10.40.91.184:5100",  # ← all traffic through gateway
         sync_interval = 60.0,
+        recognizer    = recognizer,
     )
     _syncer.start_syncing()
 

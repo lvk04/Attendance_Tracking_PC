@@ -21,7 +21,7 @@ logging.basicConfig(
 # ── Config ────────────────────────────────────────────────────────────────────
 HOST_BASE_URL = os.environ.get("HOST_BASE_URL", "http://127.0.0.1:5050")
 HOST_TOKEN    = os.environ.get("HOST_TOKEN",    "host_token_123")
-USE_HTTPS     = False   # ← flip to True after generating gateway.crt / gateway.key
+USE_HTTPS     = True   # ← flip to True after generating gateway.crt / gateway.key
 
 if not HOST_TOKEN:
     raise RuntimeError("HOST_TOKEN environment variable not set.")
@@ -245,7 +245,7 @@ if __name__ == "__main__":
         ssl_context = None
 
     app.run(
-        host="127.0.0.1",   # gateway faces the network
+        host="10.40.91.184",   # gateway faces the network
         port=5100,
         ssl_context=ssl_context,
         debug=False

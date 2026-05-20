@@ -5,7 +5,13 @@ import threading
 import time
 import base64
 import requests
+import urllib3
 import numpy as np
+
+from requests.exceptions import SSLError
+
+# Suppress SSL warnings for self-signed cert fallback path
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -17,11 +23,11 @@ PRIVATE_KEY_PATH = os.path.join(
     "keys", DEVICE_ID, "private_key.pem"
 )
 
-USE_HTTPS    = False
+USE_HTTPS    = True
 GATEWAY_CERT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateway.crt")
 
 # ── Faces sync interval (separate from attendance) ────────────────────────────
-FACES_SYNC_INTERVAL = 1800  # 30 minutes
+FACES_SYNC_INTERVAL = 5  #5 seconds
 
 
 def _load_private_key():
@@ -64,25 +70,38 @@ def make_headers(body_str: str) -> dict:
 
 
 def signed_post(url: str, payload: dict, verify) -> requests.Response:
-    """Serialize payload once, sign it, send it."""
+    """Serialize payload once, sign it, send it.
+
+    Tries cert-pinned verification first. Falls back to
+    verify=False on SSLError (self-signed cert drift).
+    """
     body_str = json.dumps(payload, separators=(',', ':'), sort_keys=True)
-    return requests.post(
-        url,
-        data=body_str,
-        headers=make_headers(body_str),
-        verify=verify,
-        timeout=10,
-    )
+    headers  = make_headers(body_str)
+    try:
+        return requests.post(url, data=body_str, headers=headers,
+                             verify=verify, timeout=10)
+    except SSLError:
+        if verify:
+            print(f"SSL verify failed for {url} — retrying without verification.")
+            return requests.post(url, data=body_str, headers=headers,
+                                 verify=False, timeout=10)
+        raise
 
 
 def signed_get(url: str, verify) -> requests.Response:
-    """Sign a GET request — body is empty string."""
-    return requests.get(
-        url,
-        headers=make_headers(""),
-        verify=verify,
-        timeout=10,
-    )
+    """Sign a GET request — body is empty string.
+
+    Tries cert-pinned verification first. Falls back to
+    verify=False on SSLError (self-signed cert drift).
+    """
+    headers = make_headers("")
+    try:
+        return requests.get(url, headers=headers, verify=verify, timeout=10)
+    except SSLError:
+        if verify:
+            print(f"SSL verify failed for {url} — retrying without verification.")
+            return requests.get(url, headers=headers, verify=False, timeout=10)
+        raise
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -90,10 +109,11 @@ def signed_get(url: str, verify) -> requests.Response:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AttendanceSyncer:
-    def __init__(self, db_path, gateway_url, faces_db_path, sync_interval=60.0):
+    def __init__(self, db_path, gateway_url, faces_db_path, sync_interval=60.0, recognizer=None):
         self.db_path          = db_path
         self.faces_db_path    = faces_db_path
         self.sync_interval    = sync_interval
+        self.recognizer       = recognizer
         self.syncing          = False
         self.running          = False
         self.thread           = None
@@ -107,12 +127,12 @@ class AttendanceSyncer:
         self.faces_upload_url  = f"{self.gateway_url}/faces/upload"
         self.faces_delete_url  = f"{self.gateway_url}/faces/delete"
 
-        # HTTPS cert verification
+        # HTTPS cert verification — pin self-signed gateway cert
         if USE_HTTPS and os.path.exists(GATEWAY_CERT):
             self.verify = GATEWAY_CERT
             print(f"HTTPS enabled. Cert pinned to: {GATEWAY_CERT}")
         elif USE_HTTPS:
-            print("WARNING: USE_HTTPS=True but gateway.crt not found — using HTTP.")
+            print("WARNING: USE_HTTPS=True but gateway.crt not found — skipping verification.")
             self.verify = False
         else:
             self.verify = False
@@ -154,21 +174,22 @@ class AttendanceSyncer:
 
     # ── Faces Loop ────────────────────────────────────────────────────────────
 
-    def _faces_loop(self):
-        # Push any unsynced local registrations immediately on startup
-        self._push_new_embeddings()
-        # Then pull from host
-        self._pull_faces_if_outdated()
+    PUSH_RETRY_INTERVAL = 30  # seconds when push fails
 
+    def _faces_loop(self):
         while self.running:
-            for _ in range(FACES_SYNC_INTERVAL):
+            result = self._push_new_embeddings()
+            self._pull_faces_if_outdated(recognizer=self.recognizer)
+
+            if result is False:
+                interval = self.PUSH_RETRY_INTERVAL
+            else:
+                interval = FACES_SYNC_INTERVAL
+
+            for _ in range(interval):
                 if not self.running:
                     break
                 time.sleep(1)
-            if not self.running:
-                break
-            self._push_new_embeddings()
-            self._pull_faces_if_outdated()
 
     # ══════════════════════════════════════════════════════════════════════════
     #  ATTENDANCE SYNC
@@ -178,6 +199,7 @@ class AttendanceSyncer:
         if not os.path.exists(self.db_path) or self.syncing:
             return
 
+        self.syncing = True
         try:
             with sqlite3.connect(self.db_path) as conn:
                 try:
@@ -195,7 +217,6 @@ class AttendanceSyncer:
             if not rows:
                 return
 
-            self.syncing = True
             pending_ids  = [row[0] for row in rows]
             payload      = {
                 "records": [
@@ -209,13 +230,12 @@ class AttendanceSyncer:
                 self._mark_attendance_synced(pending_ids)
             else:
                 print(f"ATTENDANCE SYNC FAILED: {response.status_code} — {response.text}")
-                self.syncing = False
 
         except requests.RequestException as e:
             print(f"ATTENDANCE SYNC FAILED: {e}. Will retry.")
-            self.syncing = False
         except Exception as e:
             print(f"Attendance Sync Error: {e}")
+        finally:
             self.syncing = False
 
     def _mark_attendance_synced(self, pending_ids):
@@ -230,21 +250,24 @@ class AttendanceSyncer:
             print(f"ATTENDANCE SYNC SUCCESS: {len(pending_ids)} records uploaded.")
         except Exception as e:
             print(f"Failed to mark attendance synced: {e}")
-        finally:
-            self.syncing = False
 
     # ══════════════════════════════════════════════════════════════════════════
     #  FACES PUSH — send new local registrations to host
     # ══════════════════════════════════════════════════════════════════════════
 
     def _push_new_embeddings(self):
-        """Push locally registered embeddings that haven't been uploaded yet."""
+        """Push locally registered embeddings that haven't been uploaded yet.
+
+        Returns:
+            None  – nothing to push (no db, no unsynced rows)
+            True  – push succeeded (HTTP 200)
+            False – push failed (network error, non-200, etc.)
+        """
         if not os.path.exists(self.faces_db_path):
-            return
+            return None
 
         try:
             with sqlite3.connect(self.faces_db_path) as conn:
-                # Ensure synced column exists
                 try:
                     conn.execute(
                         "ALTER TABLE user_embeddings ADD COLUMN synced INTEGER DEFAULT 0"
@@ -258,7 +281,7 @@ class AttendanceSyncer:
                 ).fetchall()
 
             if not rows:
-                return
+                return None
 
             pending_ids = [row[0] for row in rows]
             embeddings  = [
@@ -286,13 +309,17 @@ class AttendanceSyncer:
                     conn.commit()
                 result = response.json()
                 print(f"FACES PUSH SUCCESS: {len(pending_ids)} embeddings uploaded. Host version now {result.get('version')}.")
+                return True
             else:
                 print(f"FACES PUSH FAILED: {response.status_code} — {response.text}")
+                return False
 
         except requests.RequestException as e:
             print(f"FACES PUSH FAILED: {e}. Will retry.")
+            return False
         except Exception as e:
             print(f"Faces Push Error: {e}")
+            return False
 
     # ══════════════════════════════════════════════════════════════════════════
     #  FACES PULL — download master faces.db if host has newer version
@@ -361,9 +388,29 @@ class AttendanceSyncer:
             data       = response.json()
             embeddings = data.get("embeddings", [])
 
-            # 3. Replace local faces.db embeddings
+            # 3. Preserve unsynced local embeddings so they survive the pull
+            unsynced = []
+            if os.path.exists(self.faces_db_path):
+                try:
+                    with sqlite3.connect(self.faces_db_path) as conn:
+                        rows = conn.execute(
+                            "SELECT person_name, embedding, device_id, registered_at "
+                            "FROM user_embeddings WHERE synced = 0"
+                        ).fetchall()
+                        unsynced = [
+                            {
+                                "person_name":   r[0],
+                                "embedding":     r[1],
+                                "device_id":     r[2],
+                                "registered_at": r[3],
+                            }
+                            for r in rows
+                        ]
+                except sqlite3.OperationalError:
+                    pass
+
+            # 4. Replace local faces.db embeddings with master copy
             with sqlite3.connect(self.faces_db_path) as conn:
-                # Ensure table exists
                 conn.execute('''
                     CREATE TABLE IF NOT EXISTS user_embeddings (
                         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -375,7 +422,6 @@ class AttendanceSyncer:
                     )
                 ''')
 
-                # Clear existing embeddings — replace with master copy
                 conn.execute("DELETE FROM user_embeddings")
 
                 for emb in embeddings:
@@ -391,14 +437,28 @@ class AttendanceSyncer:
                         emb.get("registered_at", ""),
                     ))
 
+                # Re-insert unsynced local embeddings that host doesn't have yet
+                for emb in unsynced:
+                    conn.execute('''
+                        INSERT INTO user_embeddings
+                            (person_name, embedding, device_id, registered_at, synced)
+                        VALUES (?, ?, ?, ?, 0)
+                    ''', (
+                        emb["person_name"],
+                        emb["embedding"],
+                        emb["device_id"],
+                        emb["registered_at"],
+                    ))
+
                 conn.commit()
 
-            # 4. Update local version
+            # 5. Update local version
             self._update_local_faces_version(host_version, updated_at)
 
-            print(f"FACES PULL SUCCESS: {len(embeddings)} embeddings. Local version now {host_version}.")
+            total = len(embeddings) + len(unsynced)
+            print(f"FACES PULL SUCCESS: {total} embeddings ({len(unsynced)} local unsynced preserved). Local version now {host_version}.")
 
-            # 5. Hot-reload recognizer if provided
+            # 6. Hot-reload recognizer if provided
             if recognizer is not None:
                 recognizer.load_database(os.path.dirname(self.faces_db_path))
                 print("FACES: Recognizer hot-reloaded.")
