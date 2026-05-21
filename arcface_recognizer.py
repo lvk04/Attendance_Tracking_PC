@@ -57,17 +57,17 @@ class ArcFaceRecognizer:
         finally:
             conn.close()
 
-    def get_embedding(self, face_bgr):
-        """Generate embedding vector from a BGR face image."""
-        resized = cv2.resize(face_bgr, (112, 112))
-        # Convert BGR to RGB and scale to [-1, 1] which is required by ArcFace models
-        # (img - 127.5) / 127.5
-        blob = cv2.dnn.blobFromImage(
-            resized, scalefactor=1.0/127.5, size=(112, 112),
-            mean=(127.5, 127.5, 127.5), swapRB=True
-        )
-        self.net.setInput(blob)
-        return self.net.forward()[0]
+    def get_embedding(self, cropped_face_bgr):
+            resized = cv2.resize(cropped_face_bgr, (112, 112))
+            blob = cv2.dnn.blobFromImage(
+                resized, scalefactor=1.0/127.5, size=(112, 112), 
+                mean=(127.5, 127.5, 127.5), swapRB=True
+            )
+            self.net.setInput(blob)
+            emb = self.net.forward()[0]
+            
+            # Safe L2 Normalization (adds a tiny epsilon value to prevent division by zero)
+            return emb / (np.linalg.norm(emb) + 1e-10)
 
     def cosine_similarity(self, a, b):
         """Cosine similarity between two vectors. 1.0 = identical."""
