@@ -422,7 +422,7 @@ class AttendanceSyncer:
                     )
                 ''')
 
-                conn.execute("DELETE FROM user_embeddings")
+                conn.execute("DELETE FROM user_embeddings WHERE synced = 1")
 
                 for emb in embeddings:
                     embedding_bytes = base64.b64decode(emb["embedding"])

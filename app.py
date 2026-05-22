@@ -202,8 +202,8 @@ def api_register_frame():
             "progress":  0,
         })
 
+    crop_bgr = ArcFaceRecognizer.pad_to_square(detector.crop_face(frame, face))
     if reg["bursting"]:
-        crop_bgr = detector.crop_face(frame, face)
         reg["shots"] += 1
         ts   = int(time.time() * 1000)
         path = os.path.join(reg["dir"], f"face_{reg['shots']}_{ts}.jpg")
@@ -216,7 +216,6 @@ def api_register_frame():
 
         if reg["stability"] >= reg["stability_threshold"]:
             reg["bursting"] = True
-            crop_bgr = detector.crop_face(frame, face)
             reg["shots"] += 1
             ts   = int(time.time() * 1000)
             path = os.path.join(reg["dir"], f"face_{reg['shots']}_{ts}.jpg")
@@ -286,8 +285,8 @@ def api_register_finish():
     conn.close()
 
     # ── Delete raw images after embedding extraction ──────────────────────────
-    shutil.rmtree(person_dir)
-    print(f"Deleted raw images for '{name}' after embedding extraction.")
+    #shutil.rmtree(person_dir)
+    #print(f"Deleted raw images for '{name}' after embedding extraction.")
 
     # ── Reload recognizer ─────────────────────────────────────────────────────
     recognizer.load_database(DATA_DIR)

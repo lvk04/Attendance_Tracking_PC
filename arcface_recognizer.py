@@ -57,8 +57,21 @@ class ArcFaceRecognizer:
         finally:
             conn.close()
 
+    @staticmethod
+    def pad_to_square(img_bgr):
+        h, w = img_bgr.shape[:2]
+        if h == w:
+            return img_bgr
+        size = max(h, w)
+        top = (size - h) // 2
+        bottom = size - h - top
+        left = (size - w) // 2
+        right = size - w - left
+        return cv2.copyMakeBorder(img_bgr, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+
     def get_embedding(self, cropped_face_bgr):
-            resized = cv2.resize(cropped_face_bgr, (112, 112))
+            square = self.pad_to_square(cropped_face_bgr)
+            resized = cv2.resize(square, (112, 112))
             blob = cv2.dnn.blobFromImage(
                 resized, scalefactor=1.0/127.5, size=(112, 112), 
                 mean=(127.5, 127.5, 127.5), swapRB=True

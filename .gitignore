@@ -16,3 +16,6 @@ Thumbs.db
 arcface.onnx
 MobileFaceNet.onnx
 *.db
+*.jpg
+*.jpeg
+*.png
