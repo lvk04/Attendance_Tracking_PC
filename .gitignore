@@ -1,7 +1,7 @@
 .venv/
 __pycache__/
 *.py[cod]
-
+/.kilo/
 # Local runtime artifacts
 master_attendance.db
 gateway.crt
@@ -19,3 +19,4 @@ MobileFaceNet.onnx
 *.jpg
 *.jpeg
 *.png
+getip.py

@@ -6,6 +6,7 @@ import base64
 import threading
 import logging
 import os
+import zmq
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -21,7 +22,7 @@ logging.basicConfig(
 # ── Config ────────────────────────────────────────────────────────────────────
 HOST_BASE_URL = os.environ.get("HOST_BASE_URL", "http://127.0.0.1:5050")
 HOST_TOKEN    = os.environ.get("HOST_TOKEN",    "host_token_123")
-USE_HTTPS     = True   # ← flip to True after generating gateway.crt / gateway.key
+USE_HTTPS     = False   # ← flip to True after generating gateway.crt / gateway.key
 
 if not HOST_TOKEN:
     raise RuntimeError("HOST_TOKEN environment variable not set.")
@@ -74,6 +75,10 @@ def _cleanup_loop():
 
 threading.Thread(target=_cleanup_loop, daemon=True).start()
 
+# ── ZMQ Push to Camera Tracker ────────────────────────────────────────────────
+_zmq_context = zmq.Context()
+_tracker_push = _zmq_context.socket(zmq.PUSH)
+_tracker_push.bind("tcp://127.0.0.1:5557")
 
 # ── RSA Signature Verification ────────────────────────────────────────────────
 def verify_request(req, raw_body: str) -> tuple:
@@ -187,6 +192,27 @@ def health():
     }), 200
 
 
+@app.route("/camera/track", methods=["POST"])
+def camera_track():
+    raw_body = request.get_data(as_text=True)
+    device_id, error = verify_request(request, raw_body)
+    if error:
+        return jsonify({"error": error}), 401
+
+    data = request.get_json()
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+
+    _tracker_push.send_json({
+        "action": "track",
+        "name": name,
+        "device_id": device_id,
+        "timestamp": time.time(),
+    })
+    return jsonify({"status": "ok", "name": name}), 200
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  CATCH-ALL PROXY  (verify RSA → forward everything else to host)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -245,7 +271,7 @@ if __name__ == "__main__":
         ssl_context = None
 
     app.run(
-        host="10.40.91.184",   # gateway faces the network
+        host="10.40.91.141",   # gateway faces the network
         port=5100,
         ssl_context=ssl_context,
         debug=False

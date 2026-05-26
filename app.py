@@ -356,6 +356,9 @@ def api_recognize_frame():
                 recognizer.log_attendance(name)
                 recog_state["recently_logged"][name] = now
                 logged = True
+                if _syncer is not None:
+                    import threading
+                    threading.Thread(target=_syncer.signal_track, args=(name,), daemon=True).start()
     else:
         recog_state["tracking_name"]      = None
         recog_state["consecutive_matches"] = 0
@@ -439,7 +442,7 @@ if __name__ == "__main__":
     _syncer = AttendanceSyncer(
         db_path       = ATTENDANCE_DB,
         faces_db_path = FACES_DB,
-        gateway_url   = "https://10.40.91.184:5100",  # ← all traffic through gateway
+        gateway_url   = "http://10.40.91.141:5100",  # ← all traffic through gateway
         sync_interval = 60.0,
         recognizer    = recognizer,
     )

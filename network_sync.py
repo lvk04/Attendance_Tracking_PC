@@ -23,7 +23,7 @@ PRIVATE_KEY_PATH = os.path.join(
     "keys", DEVICE_ID, "private_key.pem"
 )
 
-USE_HTTPS    = True
+USE_HTTPS    = False
 GATEWAY_CERT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateway.crt")
 
 # ── Faces sync interval (separate from attendance) ────────────────────────────
@@ -489,3 +489,22 @@ class AttendanceSyncer:
                 print(f"FACES DELETE FAILED: {response.status_code} — {response.text}")
         except requests.RequestException as e:
             print(f"FACES DELETE FAILED: {e}")
+
+    def signal_track(self, person_name: str):
+        """
+        Immediately notify the gateway that this person was recognized,
+        so the camera tracker can begin tracking them.
+        """
+        payload = {"name": person_name}
+        try:
+            response = signed_post(
+                f"{self.gateway_url}/camera/track",
+                payload,
+                self.verify,
+            )
+            if response.status_code == 200:
+                print(f"TRACK SIGNAL: '{person_name}' sent to camera tracker.")
+            else:
+                print(f"TRACK SIGNAL FAILED: {response.status_code} — {response.text}")
+        except requests.RequestException as e:
+            print(f"TRACK SIGNAL ERROR: {e}")
