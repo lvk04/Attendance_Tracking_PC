@@ -78,7 +78,7 @@ threading.Thread(target=_cleanup_loop, daemon=True).start()
 # ── ZMQ Push to Camera Tracker ────────────────────────────────────────────────
 _zmq_context = zmq.Context()
 _tracker_push = _zmq_context.socket(zmq.PUSH)
-_tracker_push.bind("tcp://127.0.0.1:5557")
+_tracker_push.bind("tcp://0.0.0.0:5557")
 
 # ── RSA Signature Verification ────────────────────────────────────────────────
 def verify_request(req, raw_body: str) -> tuple:
