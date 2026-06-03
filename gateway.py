@@ -35,7 +35,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── Camera Tracker Status Polling ──────────────────────────────────────────
 OCCUPANCY_DB = os.path.join(BASE_DIR, "occupancy.db")
-CAMERA_STATUS_URL = os.environ.get("CAMERA_STATUS_URL", "http://10.40.91.80:5150/status")
+CAMERA_STATUS_URL = os.environ.get("CAMERA_STATUS_URL", "http://10.40.90.221:5150/status")
 
 GATEWAY_START_TIME = time.time()
 _camera_first_data_time: float | None = None
@@ -105,13 +105,20 @@ def setup_occupancy_db():
                 known_count     INTEGER NOT NULL,
                 unknown_count   INTEGER NOT NULL,
                 linked_names    TEXT    DEFAULT '[]',
-                pending_names   TEXT    DEFAULT '[]'
+                pending_names   TEXT    DEFAULT '[]',
+                cpu_percent     REAL    DEFAULT 0.0,
+                gpu_percent     REAL    DEFAULT 0.0
             )
         ''')
         conn.execute('''
             CREATE INDEX IF NOT EXISTS idx_occupancy_ts
             ON occupancy_snapshots(timestamp)
         ''')
+        for col in ("cpu_percent", "gpu_percent"):
+            try:
+                conn.execute(f"ALTER TABLE occupancy_snapshots ADD COLUMN {col} REAL DEFAULT 0.0")
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
 
 
@@ -134,6 +141,8 @@ def _poll_camera_status():
         pending      = data.get("pending_targets", [])
         linked_in_frame = int(data.get("linked_in_frame", 0))
         linked_in_frame_names = data.get("linked_in_frame_names", [])
+        cpu_percent = float(data.get("cpu_percent", 0))
+        gpu_percent = float(data.get("gpu_percent", 0))
         known_count  = linked_in_frame
         unknown_count = max(0, people_count - known_count)
 
@@ -148,8 +157,8 @@ def _poll_camera_status():
             conn.execute('''
                 INSERT INTO occupancy_snapshots
                     (timestamp, people_count, known_count, unknown_count,
-                     linked_names, pending_names)
-                VALUES (?, ?, ?, ?, ?, ?)
+                     linked_names, pending_names, cpu_percent, gpu_percent)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 time.time(),
                 people_count,
@@ -157,6 +166,8 @@ def _poll_camera_status():
                 unknown_count,
                 json.dumps(linked_in_frame_names),
                 json.dumps(pending),
+                cpu_percent,
+                gpu_percent,
             ))
             conn.commit()
     except requests.RequestException as exc:
@@ -313,7 +324,7 @@ def dashboard_data():
     with sqlite3.connect(OCCUPANCY_DB) as conn:
         rows = conn.execute('''
             SELECT timestamp, people_count, known_count, unknown_count,
-                   linked_names, pending_names
+                   linked_names, pending_names, cpu_percent, gpu_percent
             FROM occupancy_snapshots
             WHERE timestamp > ?
             ORDER BY timestamp ASC
@@ -330,6 +341,8 @@ def dashboard_data():
             "unknown":  current[3] if current else 0,
             "linked":   json.loads(current[4]) if current else [],
             "pending":  json.loads(current[5]) if current else [],
+            "cpu":      current[6] if current else 0,
+            "gpu":      current[7] if current else 0,
             "time":     current[0] if current else 0,
         },
         "uptime": {
@@ -440,6 +453,19 @@ DASHBOARD_HTML = r"""
                 <div id="uptime-camera" class="uptime-value">--</div>
                 <div class="card-small">Camera</div>
             </div>
+            <div class="card">
+                <div class="card-label">System</div>
+                <div class="uptime-block">
+                    <div class="uptime-row">
+                        <span class="uptime-val" id="cpu-val">--</span>
+                        <span class="uptime-lbl">CPU</span>
+                    </div>
+                    <div class="uptime-row">
+                        <span class="uptime-val" id="gpu-val">--</span>
+                        <span class="uptime-lbl">GPU</span>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -475,6 +501,8 @@ DASHBOARD_HTML = r"""
                     document.getElementById('unknown-count').textContent = d.current.unknown;
                     document.getElementById('uptime-gateway').textContent = fmtUptime(d.uptime.gateway);
                     document.getElementById('uptime-camera').textContent = fmtUptime(d.uptime.camera);
+                    document.getElementById('cpu-val').textContent = Math.round(d.current.cpu) + '%';
+                    document.getElementById('gpu-val').textContent = Math.round(d.current.gpu) + '%';
 
                     const list = document.getElementById('tracked-list');
                     list.innerHTML = '';
@@ -641,7 +669,7 @@ if __name__ == "__main__":
         ssl_context = None
 
     app.run(
-        host="10.40.91.141",   # gateway faces the network
+        host="10.40.90.214",   # gateway faces the network
         port=5100,
         ssl_context=ssl_context,
         debug=False

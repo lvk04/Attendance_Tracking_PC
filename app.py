@@ -161,7 +161,7 @@ def api_register_frame():
     if not sid or sid not in reg_sessions:
         return jsonify({"error": "Invalid session"}), 400
 
-    reg = reg_sessions[sid]
+reg = reg_sessions[sid]
 
     if reg["shots"] >= reg["max_shots"]:
         return jsonify({
