@@ -161,7 +161,7 @@ def api_register_frame():
     if not sid or sid not in reg_sessions:
         return jsonify({"error": "Invalid session"}), 400
 
-reg = reg_sessions[sid]
+    reg = reg_sessions[sid]
 
     if reg["shots"] >= reg["max_shots"]:
         return jsonify({
@@ -431,7 +431,8 @@ def api_attendance_today():
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-from network_sync import AttendanceSyncer
+from network_sync import AttendanceSyncer, USE_HTTPS
+import zeroconf_utils
 
 if __name__ == "__main__":
     print("=" * 50)
@@ -439,10 +440,18 @@ if __name__ == "__main__":
     print("  Open http://localhost:5000 in your browser")
     print("=" * 50)
 
+    gw_info = zeroconf_utils.discover_service("_gateway-http._tcp", timeout=3.0)
+    if gw_info:
+        gateway_url = zeroconf_utils.resolve_url(gw_info, use_https=USE_HTTPS)
+        print(f"Zeroconf: discovered gateway at {gateway_url}")
+    else:
+        gateway_url = os.environ.get("GATEWAY_URL", "http://127.0.0.1:5100")
+        print(f"Zeroconf: no gateway found, using {gateway_url}")
+
     _syncer = AttendanceSyncer(
         db_path       = ATTENDANCE_DB,
         faces_db_path = FACES_DB,
-        gateway_url   = "http://10.40.91.141:5100",  # ← all traffic through gateway
+        gateway_url   = gateway_url,
         sync_interval = 60.0,
         recognizer    = recognizer,
     )

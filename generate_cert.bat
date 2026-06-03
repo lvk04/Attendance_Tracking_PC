@@ -1,25 +1,22 @@
-::RUn this script on gateway's system
+:: generate_cert.bat — run on each machine with appropriate hostname
+:: Usage: generate_cert.bat <hostname.local>
+:: Example: generate_cert.bat gateway.local
 @echo off
-echo Generating self-signed certificate for gateway...
-
-:: Get the local IP address (first non-loopback IPv4)
-for /f "tokens=2 delims=:" %%a in ('ipconfig ^| findstr /r "IPv4.*[0-9][0-9]*\.[0-9]"') do (
-    set GATEWAY_IP=%%a
-    goto :found
+set HOSTNAME=%~1
+if "%HOSTNAME%"=="" (
+    echo Usage: generate_cert.bat ^<hostname.local^>
+    echo Example: generate_cert.bat gateway.local
+    exit /b 1
 )
 
-:found
-:: Trim leading space
-set GATEWAY_IP=%GATEWAY_IP: =%
-
-echo Using IP: %GATEWAY_IP%
+echo Generating self-signed certificate for %HOSTNAME%...
 
 openssl req -x509 -newkey rsa:4096 -nodes ^
     -keyout gateway.key ^
     -out gateway.crt ^
-    -days 365 ^
-    -subj "/CN=%GATEWAY_IP%" ^
-    -addext "subjectAltName=IP:%GATEWAY_IP%"
+    -days 3650 ^
+    -subj "/CN=%HOSTNAME%" ^
+    -addext "subjectAltName=DNS:%HOSTNAME%,DNS:localhost,IP:127.0.0.1"
 
 echo.
 echo Done! Files created:

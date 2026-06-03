@@ -13,6 +13,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.exceptions import InvalidSignature
 
+import zeroconf_utils
+
 app = Flask(__name__)
 
 logging.basicConfig(
@@ -35,7 +37,22 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── Camera Tracker Status Polling ──────────────────────────────────────────
 OCCUPANCY_DB = os.path.join(BASE_DIR, "occupancy.db")
-CAMERA_STATUS_URL = os.environ.get("CAMERA_STATUS_URL", "http://10.40.90.221:5150/status")
+CAMERA_STATUS_URL_FALLBACK = os.environ.get("CAMERA_STATUS_URL", "")
+
+_camera_url_cache: str | None = None
+_camera_failures = 0
+
+def _resolve_camera_url() -> str:
+    global _camera_url_cache
+    if _camera_url_cache:
+        return _camera_url_cache
+    info = zeroconf_utils.discover_service("_camera-http._tcp", timeout=1.0)
+    if info:
+        _camera_url_cache = f"{zeroconf_utils.resolve_url(info, use_https=USE_HTTPS)}/status"
+        return _camera_url_cache
+    if CAMERA_STATUS_URL_FALLBACK:
+        return CAMERA_STATUS_URL_FALLBACK
+    return ""
 
 GATEWAY_START_TIME = time.time()
 _camera_first_data_time: float | None = None
@@ -131,9 +148,17 @@ def _retention_cleanup():
 
 
 def _poll_camera_status():
-    global _camera_first_data_time
+    global _camera_first_data_time, _camera_url_cache, _camera_failures
+    camera_url = _resolve_camera_url()
+    if not camera_url:
+        _camera_first_data_time = None
+        return
     try:
-        resp = requests.get(CAMERA_STATUS_URL, timeout=5)
+        req_kwargs = {"timeout": 5}
+        if USE_HTTPS:
+            req_kwargs["verify"] = False
+        resp = requests.get(camera_url, **req_kwargs)
+        _camera_failures = 0
         data = resp.json()
 
         people_count = int(data.get("total_tracked", 0))
@@ -172,7 +197,10 @@ def _poll_camera_status():
             conn.commit()
     except requests.RequestException as exc:
         _camera_first_data_time = None
-        logging.warning("Camera status poll failed: %s", exc)
+        _camera_failures += 1
+        if _camera_failures >= 3:
+            _camera_url_cache = None
+        logging.warning("Camera status poll failed (%d/3): %s", _camera_failures, exc)
     except Exception as exc:
         logging.error("Camera status poll unexpected error: %s", exc)
 
@@ -180,6 +208,14 @@ def _poll_camera_status():
 setup_occupancy_db()
 _start_daemon("occupancy-cleanup", _retention_cleanup, 3600)
 _start_daemon("camera-poller", _poll_camera_status, 2.0)
+
+_zc_gateway_http = zeroconf_utils.advertise_service(
+    "_gateway-http._tcp", "GatewayHTTP", 5100
+)
+_zc_gateway_zmq = zeroconf_utils.advertise_service(
+    "_gateway-zmq._tcp", "GatewayZMQ", 5557
+)
+print(f"Zeroconf: advertising _gateway-http._tcp (port 5100) and _gateway-zmq._tcp (port 5557)")
 
 # ── RSA Signature Verification ────────────────────────────────────────────────
 def verify_request(req, raw_body: str) -> tuple:
@@ -669,7 +705,7 @@ if __name__ == "__main__":
         ssl_context = None
 
     app.run(
-        host="10.40.90.214",   # gateway faces the network
+        host="0.0.0.0",   # bind all interfaces — zeroconf discovers IP automatically
         port=5100,
         ssl_context=ssl_context,
         debug=False
