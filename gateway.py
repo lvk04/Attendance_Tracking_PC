@@ -592,14 +592,6 @@ DASHBOARD_HTML = r"""
                                 labels: labels,
                                 datasets: [
                                     {
-                                        label: 'Total',
-                                        data: totalData,
-                                        borderColor: '#58a6ff',
-                                        backgroundColor: '#1f6feb33',
-                                        borderWidth: 2, fill: true, tension: 0.3,
-                                        pointRadius: 1, pointHoverRadius: 5,
-                                    },
-                                    {
                                         label: 'Known',
                                         data: knownData,
                                         borderColor: '#3fb950',
@@ -615,18 +607,26 @@ DASHBOARD_HTML = r"""
                                         borderWidth: 2, fill: true, tension: 0.3,
                                         pointRadius: 1, pointHoverRadius: 5,
                                     },
+                                    {
+                                        label: 'Total',
+                                        data: totalData,
+                                        borderColor: '#58a6ff',
+                                        backgroundColor: '#1f6feb33',
+                                        borderWidth: 2, fill: false, tension: 0.3,
+                                        pointRadius: 1, pointHoverRadius: 5,
+                                    },
                                 ]
                             },
-                            options: {
-                                responsive: true,
-                                maintainAspectRatio: false,
-                                scales: {
-                                    x: { ticks: { color: '#8b949e', maxTicksLimit: 16 }, grid: { color: '#21262d' } },
-                                    y: { beginAtZero: true, ticks: { color: '#8b949e', stepSize: 1 },
-                                         stacked: false, grid: { color: '#21262d' } }
-                                },
-                                plugins: { legend: { labels: { color: '#c9d1d9' } } }
-                            }
+                                options: {
+                                    responsive: true,
+                                    maintainAspectRatio: false,
+                                    scales: {
+                                        x: { ticks: { color: '#8b949e', maxTicksLimit: 16 }, grid: { color: '#21262d' } },
+                                        y: { beginAtZero: true, ticks: { color: '#8b949e', stepSize: 1 },
+                                             stacked: true, grid: { color: '#21262d' } }
+                                    },
+                                    plugins: { legend: { labels: { color: '#c9d1d9' } } }
+                                }
                         });
                     }
                     }
