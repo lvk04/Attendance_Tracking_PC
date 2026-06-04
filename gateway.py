@@ -54,8 +54,9 @@ def _resolve_camera_url() -> str:
         return CAMERA_STATUS_URL_FALLBACK
     return ""
 
-GATEWAY_START_TIME = time.time()
+GATEWAY_START_TIME: float | None = None
 _camera_first_data_time: float | None = None
+_camera_last_online: float = 0.0
 
 # ── Public Key Registry ───────────────────────────────────────────────────────
 PUBLIC_KEYS_DIR = os.path.join(BASE_DIR, "public_keys")
@@ -148,10 +149,9 @@ def _retention_cleanup():
 
 
 def _poll_camera_status():
-    global _camera_first_data_time, _camera_url_cache, _camera_failures
+    global _camera_first_data_time, _camera_url_cache, _camera_failures, _camera_last_online
     camera_url = _resolve_camera_url()
     if not camera_url:
-        _camera_first_data_time = None
         return
     try:
         req_kwargs = {"timeout": 5}
@@ -160,6 +160,9 @@ def _poll_camera_status():
         resp = requests.get(camera_url, **req_kwargs)
         _camera_failures = 0
         data = resp.json()
+
+        now = time.time()
+        _camera_last_online = now
 
         people_count = int(data.get("total_tracked", 0))
         linked       = data.get("linked_targets", {})
@@ -175,7 +178,7 @@ def _poll_camera_status():
             logging.warning("linked_in_frame (%d) exceeds linked_targets count (%d)", linked_in_frame, len(linked))
 
         if _camera_first_data_time is None and people_count >= 0:
-            _camera_first_data_time = time.time()
+            _camera_first_data_time = now
 
         with sqlite3.connect(OCCUPANCY_DB) as conn:
             conn.execute("PRAGMA busy_timeout=5000")
@@ -185,7 +188,7 @@ def _poll_camera_status():
                      linked_names, pending_names, cpu_percent, gpu_percent)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                time.time(),
+                now,
                 people_count,
                 known_count,
                 unknown_count,
@@ -196,7 +199,6 @@ def _poll_camera_status():
             ))
             conn.commit()
     except requests.RequestException as exc:
-        _camera_first_data_time = None
         _camera_failures += 1
         if _camera_failures >= 3:
             _camera_url_cache = None
@@ -219,20 +221,13 @@ print(f"Zeroconf: advertising _gateway-http._tcp (port 5100) and _gateway-zmq._t
 
 # ── RSA Signature Verification ────────────────────────────────────────────────
 def verify_request(req, raw_body: str) -> tuple:
-    """
-    Verify RSA-PSS signature on any incoming request.
-    Uses raw_body string to avoid JSON re-serialization mismatch.
-    Returns (device_id, None) on success or (None, error_string) on failure.
-    """
     device_id = req.headers.get("X-Device-ID")
     timestamp = req.headers.get("X-Timestamp")
     signature = req.headers.get("X-Signature")
 
-    # 1. All auth headers must be present
     if not all([device_id, timestamp, signature]):
         return None, "Missing authentication headers"
 
-    # 2. Timestamp freshness
     try:
         age = abs(int(time.time()) - int(timestamp))
     except ValueError:
@@ -241,7 +236,6 @@ def verify_request(req, raw_body: str) -> tuple:
     if age > MAX_AGE:
         return None, f"Request expired ({age}s old, max {MAX_AGE}s)"
 
-    # 3. Replay check
     sig_key = f"{device_id}.{signature[:16]}"
     with _replay_lock:
         if sig_key in _replay_window:
@@ -249,13 +243,11 @@ def verify_request(req, raw_body: str) -> tuple:
             return None, "Duplicate request"
         _replay_window[sig_key] = time.time() + MAX_AGE
 
-    # 4. Device must have a registered public key
     public_key = _public_keys.get(device_id)
     if not public_key:
         logging.warning(f"Unknown device: '{device_id}'")
         return None, "Unknown device"
 
-    # 5. Verify RSA-PSS signature against raw body
     try:
         sig_bytes = base64.b64decode(signature)
         message   = f"{device_id}.{timestamp}.{raw_body}".encode()
@@ -281,30 +273,23 @@ def verify_request(req, raw_body: str) -> tuple:
 
 # ── Forward to Host ───────────────────────────────────────────────────────────
 def forward_to_host(device_id: str, path: str, method: str, raw_body: bytes, content_type: str):
-    """
-    Forward a verified request to the host, stripping RSA headers
-    and injecting HOST_TOKEN + device_id.
-    Returns a Flask Response mirroring the host's response.
-    """
     target_url = f"{HOST_BASE_URL}{path}"
 
-    # Build clean headers for host — no RSA headers, just token
     forward_headers = {
         "Content-Type":  content_type or "application/json",
         "X-Sync-Token":  HOST_TOKEN,
-        "X-Device-ID":   device_id,   # let host know which device this came from
+        "X-Device-ID":   device_id,
     }
 
     try:
         host_response = requests.request(
             method=method,
             url=target_url,
-            data=raw_body,             # forward exact raw body bytes
+            data=raw_body,
             headers=forward_headers,
             timeout=10,
         )
 
-        # Mirror host response back to edge device
         return Response(
             response=host_response.content,
             status=host_response.status_code,
@@ -317,12 +302,11 @@ def forward_to_host(device_id: str, path: str, method: str, raw_body: bytes, con
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  LOCAL ROUTES  (handled by gateway, not forwarded)
+#  LOCAL ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Gateway health check — not forwarded to host."""
     return jsonify({
         "status":             "ok",
         "registered_devices": list(_public_keys.keys()),
@@ -367,8 +351,10 @@ def dashboard_data():
         ''', (cutoff,)).fetchall()
 
     current = rows[-1] if rows else None
-    gateway_uptime  = int(time.time() - GATEWAY_START_TIME)
-    camera_uptime   = int(time.time() - _camera_first_data_time) if _camera_first_data_time else 0
+    gateway_uptime  = int(time.time() - GATEWAY_START_TIME) if GATEWAY_START_TIME else 0
+    now = time.time()
+    camera_online = (now - _camera_last_online) < 10
+    camera_uptime = int(now - _camera_first_data_time) if (_camera_first_data_time and camera_online) else 0
 
     return jsonify({
         "current": {
@@ -397,249 +383,495 @@ def dashboard_data():
     })
 
 
-DASHBOARD_HTML = r"""
-<!DOCTYPE html>
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Room Occupancy Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-            background: #0d1117; color: #c9d1d9;
-            min-height: 100vh; padding: 30px;
-        }
-        h1 { font-size: 28px; margin-bottom: 4px; color: #e6edf3; }
-        .subtitle { color: #8b949e; font-size: 14px; margin-bottom: 24px; }
-        .dashboard-layout { display: flex; gap: 16px; align-items: flex-start; }
-        .left-col { flex: 3; display: flex; flex-direction: column; gap: 16px; min-width: 0; }
-        .right-col { flex: 1; display: flex; flex-direction: column; gap: 12px; min-width: 200px; }
-        .card {
-            background: #161b22; border: 1px solid #30363d; border-radius: 12px;
-            padding: 20px;
-        }
-        .card-label { font-size: 13px; color: #8b949e; text-transform: uppercase;
-                       letter-spacing: 0.8px; margin-bottom: 8px; }
-        .card-value { font-size: 42px; font-weight: 700; color: #e6edf3; }
-        .card-small { font-size: 13px; color: #8b949e; margin-top: 4px; }
-        .tracked-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
-        .tracked-tag {
-            background: #1f6feb33; border: 1px solid #1f6feb66;
-            border-radius: 20px; padding: 4px 14px; font-size: 14px; color: #58a6ff;
-        }
-        .tracked-tag.unknown-tag {
-            background: #f8514933; border-color: #f8514966; color: #f85149;
-        }
-        .tracked-tag.pending {
-            background: #d2992233; border-color: #d2992266; color: #d29922;
-        }
-        .section-card {
-            background: #161b22; border: 1px solid #30363d; border-radius: 12px;
-            padding: 20px;
-        }
-        .section-label { font-size: 13px; color: #8b949e; text-transform: uppercase;
-                          letter-spacing: 0.8px; margin-bottom: 8px; }
-        .chart-card { display: flex; flex-direction: column; height: 350px; }
-        .chart-card .section-label { flex-shrink: 0; }
-        .chart-card canvas { width: 100%; flex: 1; }
-        .uptime-block { display: flex; flex-direction: column; gap: 4px; }
-        .uptime-row { display: flex; justify-content: space-between; align-items: baseline; }
-        .uptime-row:not(:last-child) { padding-bottom: 6px; border-bottom: 1px solid #21262d; margin-bottom: 6px; }
-        .uptime-label { font-size: 16px; color: #8b949e; }
-        .uptime-value { font-size: 22px; font-weight: 600; color: #e6edf3; }
-        .divider { border-top: 1px solid #21262d; margin: 8px 0; }
-    </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Room Occupancy</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg-base:        #0f1117;
+      --bg-surface:     #161b25;
+      --bg-elevated:    #1e2535;
+      --border-subtle:  rgba(255,255,255,0.06);
+      --border-default: rgba(255,255,255,0.10);
+      --text-primary:   #e8eaf0;
+      --text-secondary: #8b91a5;
+      --text-tertiary:  #555d72;
+      --green:          #34c97e;
+      --green-bg:       rgba(52,201,126,0.10);
+      --green-border:   rgba(52,201,126,0.25);
+      --amber:          #f5a623;
+      --amber-bg:       rgba(245,166,35,0.10);
+      --amber-border:   rgba(245,166,35,0.25);
+      --red:            #e05252;
+      --red-bg:         rgba(224,82,82,0.10);
+      --red-border:     rgba(224,82,82,0.25);
+      --blue:           #4d91e6;
+      --font-sans:      'DM Sans', sans-serif;
+      --font-mono:      'JetBrains Mono', monospace;
+      --radius-md:  8px;
+      --radius-lg:  12px;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-base);
+      color: var(--text-primary);
+      height: 100vh;
+      overflow: hidden;
+      padding: 14px 18px;
+      font-size: 13px;
+      line-height: 1.4;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Full-height dashboard grid ── */
+    .dashboard {
+      flex: 1;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      gap: 10px;
+      min-height: 0;
+    }
+
+    /* Header */
+    .header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    .header-left { display: flex; align-items: baseline; gap: 14px; }
+    .header-title { font-size: 17px; font-weight: 600; color: var(--text-primary); letter-spacing: -0.02em; }
+    .header-subtitle { font-size: 11px; color: var(--text-tertiary); font-family: var(--font-mono); }
+
+    /* Badge */
+    .badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: 11px; font-weight: 500; padding: 4px 10px;
+      border-radius: 99px; white-space: nowrap; border: 1px solid;
+    }
+    .badge-dot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
+    .badge-empty   { background: var(--amber-bg);  color: var(--amber); border-color: var(--amber-border); }
+    .badge-active  { background: var(--green-bg);  color: var(--green); border-color: var(--green-border); }
+    .badge-known   { background: var(--green-bg);  color: var(--green); border-color: var(--green-border); }
+    .badge-unknown { background: var(--red-bg);    color: var(--red);   border-color: var(--red-border);   }
+    .badge-pending { background: var(--amber-bg);  color: var(--amber); border-color: var(--amber-border); }
+    .badge-online  { background: var(--green-bg);  color: var(--green); border-color: var(--green-border); }
+    .badge-offline { background: var(--red-bg);    color: var(--red);   border-color: var(--red-border);   }
+
+    /* Persons bar */
+    .persons-bar {
+      background: var(--bg-surface); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg); padding: 9px 16px;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .persons-label { font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-tertiary); white-space: nowrap; }
+    .persons-tags  { display: flex; flex-wrap: wrap; gap: 6px; }
+
+    /* Metrics + chart + panels — main content row */
+    .main-row {
+      display: grid;
+      grid-template-columns: 220px 1fr 200px;
+      gap: 10px;
+      min-height: 0;
+    }
+
+    /* Left column: metric cards stacked */
+    .metrics-col {
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .metric-card {
+      background: var(--bg-surface); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg); padding: 14px 16px;
+      display: flex; flex-direction: column; gap: 6px;
+      flex: 1;
+      transition: border-color 0.2s;
+    }
+    .metric-card:hover { border-color: var(--border-default); }
+    .metric-label {
+      font-size: 10px; font-weight: 500; text-transform: uppercase;
+      letter-spacing: 0.07em; color: var(--text-tertiary);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .metric-value { font-size: 32px; font-weight: 600; letter-spacing: -0.03em; line-height: 1; }
+    .metric-sub   { font-size: 11px; color: var(--text-tertiary); font-family: var(--font-mono); }
+    .v-default { color: var(--text-primary); }
+    .v-green   { color: var(--green); }
+    .v-red     { color: var(--red); }
+
+    /* Centre: chart */
+    .chart-card {
+      background: var(--bg-surface); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg); padding: 16px 18px;
+      display: flex; flex-direction: column; min-height: 0;
+    }
+    .chart-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-shrink: 0; }
+    .chart-title  { font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-tertiary); }
+    .legend       { display: flex; gap: 14px; }
+    .legend-item  { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-secondary); }
+    .legend-swatch{ width: 16px; height: 3px; border-radius: 2px; }
+    .chart-wrap   { position: relative; flex: 1; min-height: 0; }
+    .chart-wrap canvas { position: absolute; inset: 0; width: 100% !important; height: 100% !important; }
+
+    /* Right column: connection + system stacked */
+    .right-col { display: flex; flex-direction: column; gap: 10px; }
+    .panel {
+      background: var(--bg-surface); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg); padding: 14px 16px;
+      flex: 1;
+    }
+    .panel-title {
+      font-size: 10px; font-weight: 500; text-transform: uppercase;
+      letter-spacing: 0.07em; color: var(--text-tertiary);
+      margin-bottom: 12px; display: flex; align-items: center; gap: 6px;
+    }
+
+    /* Status rows */
+    .status-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border-subtle); }
+    .status-row:last-of-type { border-bottom: none; }
+    .status-key { display: flex; align-items: center; gap: 7px; color: var(--text-secondary); font-size: 12px; }
+    .status-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .dot-online  { background: var(--green); box-shadow: 0 0 5px var(--green); }
+    .dot-offline { background: var(--red);   box-shadow: 0 0 5px var(--red); }
+    .uptime-note { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-subtle); font-size: 11px; color: var(--text-tertiary); font-family: var(--font-mono); }
+
+    /* System bars */
+    .sys-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border-subtle); }
+    .sys-row:last-of-type { border-bottom: none; }
+    .sys-label { font-size: 11px; color: var(--text-secondary); width: 30px; font-family: var(--font-mono); }
+    .sys-bar   { flex: 1; height: 4px; background: var(--bg-elevated); border-radius: 3px; overflow: hidden; }
+    .sys-fill  { height: 100%; border-radius: 3px; transition: width 0.6s ease; }
+    .sys-pct   { font-size: 11px; font-weight: 500; font-family: var(--font-mono); color: var(--text-secondary); width: 30px; text-align: right; }
+  </style>
 </head>
 <body>
-    <h1>Room Occupancy</h1>
-    <p class="subtitle">Live from camera tracker (polling /status every 2s) · Auto-refreshes every 2s</p>
+<div class="dashboard">
 
-    <div class="dashboard-layout">
-        <div class="left-col">
-            <div class="section-card">
-                <div class="section-label">Currently Tracked Persons</div>
-                <div id="tracked-list" class="tracked-list"></div>
-            </div>
-            <div class="section-card chart-card">
-                <div class="section-label">Occupancy Over Time (last 1 hour)</div>
-                <canvas id="chart-container"></canvas>
-            </div>
+  <!-- Row 1: Header -->
+  <div class="header">
+    <div class="header-left">
+      <div class="header-title">Room Occupancy</div>
+      <div class="header-subtitle">Live · polling /status every 2s · auto-refreshes every 2s</div>
+    </div>
+    <span class="badge badge-empty" id="header-badge">
+      <span class="badge-dot" style="background:var(--amber)"></span>No one in view
+    </span>
+  </div>
+
+  <!-- Row 2: Persons bar -->
+  <div class="persons-bar">
+    <span class="persons-label">Currently tracked</span>
+    <div class="persons-tags" id="persons-tags">
+      <span class="badge badge-empty">
+        <span class="badge-dot" style="background:var(--amber)"></span>No one in view
+      </span>
+    </div>
+  </div>
+
+  <!-- Row 3: Main content (metrics | chart | right panels) -->
+  <div class="main-row">
+
+    <!-- Left: metric cards -->
+    <div class="metrics-col">
+      <div class="metric-card">
+        <div class="metric-label">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
+          People in room
         </div>
-        <div class="right-col">
-            <div class="card">
-                <div class="card-label">People in Room</div>
-                <div id="current-count" class="card-value">--</div>
-            </div>
-            <div class="card">
-                <div class="card-label">Known</div>
-                <div id="known-count" class="card-value" style="color:#3fb950">--</div>
-            </div>
-            <div class="card">
-                <div class="card-label">Unknown</div>
-                <div id="unknown-count" class="card-value" style="color:#f85149">--</div>
-            </div>
-            <div class="card">
-                <div class="card-label">Uptime</div>
-                <div id="uptime-gateway" class="uptime-value">--</div>
-                <div class="card-small">Gateway</div>
-                <div class="divider"></div>
-                <div id="uptime-camera" class="uptime-value">--</div>
-                <div class="card-small">Camera</div>
-            </div>
-            <div class="card">
-                <div class="card-label">System</div>
-                <div class="uptime-block">
-                    <div class="uptime-row">
-                        <span class="uptime-val" id="cpu-val">--</span>
-                        <span class="uptime-lbl">CPU</span>
-                    </div>
-                    <div class="uptime-row">
-                        <span class="uptime-val" id="gpu-val">--</span>
-                        <span class="uptime-lbl">GPU</span>
-                    </div>
-                </div>
-            </div>
+        <div class="metric-value v-default" id="people-count">—</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/><polyline points="16 11 18 13 22 9"/></svg>
+          Known
         </div>
+        <div class="metric-value v-green" id="known-count">—</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/><line x1="12" y1="17" x2="12" y2="21"/><circle cx="12" cy="13" r="0.5" fill="currentColor"/></svg>
+          Unknown
+        </div>
+        <div class="metric-value v-red" id="unknown-count">—</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          Uptime
+        </div>
+        <div class="metric-value v-default" id="uptime-value" style="font-size:22px">—</div>
+        <div class="metric-sub">Gateway</div>
+      </div>
     </div>
 
-    <script>
-        let chart = null;
-        let lastChartUpdate = 0;
+    <!-- Centre: chart (fills remaining space) -->
+    <div class="chart-card">
+      <div class="chart-header">
+        <span class="chart-title">Occupancy over time (last 1 hour)</span>
+        <div class="legend">
+          <span class="legend-item"><span class="legend-swatch" style="background:#34c97e"></span>Known</span>
+          <span class="legend-item"><span class="legend-swatch" style="background:#e05252"></span>Unknown</span>
+          <span class="legend-item"><span class="legend-swatch" style="background:rgba(77,145,230,0.7)"></span>Total</span>
+        </div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="occChart" role="img" aria-label="Line chart of room occupancy over the last hour">No data yet.</canvas>
+      </div>
+    </div>
 
-        function fmtTime(ts) {
-            const d = new Date(ts * 1000);
-            return String(d.getHours()).padStart(2,'0') + ':' +
-                   String(d.getMinutes()).padStart(2,'0') + ':' +
-                   String(d.getSeconds()).padStart(2,'0');
+    <!-- Right: connection + system -->
+    <div class="right-col">
+      <div class="panel">
+        <div class="panel-title">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>
+          Connection
+        </div>
+        <div class="status-row">
+          <span class="status-key"><span class="status-dot dot-online" id="gw-dot"></span>Gateway</span>
+          <span class="badge badge-online" id="gw-badge">Online</span>
+        </div>
+        <div class="status-row">
+          <span class="status-key"><span class="status-dot" id="cam-dot"></span>Camera</span>
+          <span class="badge" id="cam-badge">—</span>
+        </div>
+        <div class="uptime-note" id="uptime-note">Gateway uptime: —</div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          System
+        </div>
+        <div class="sys-row">
+          <span class="sys-label">CPU</span>
+          <div class="sys-bar"><div class="sys-fill" id="cpu-bar" style="width:0%;background:var(--green)"></div></div>
+          <span class="sys-pct" id="cpu-pct">—</span>
+        </div>
+        <div class="sys-row">
+          <span class="sys-label">GPU</span>
+          <div class="sys-bar"><div class="sys-fill" id="gpu-bar" style="width:0%;background:var(--green)"></div></div>
+          <span class="sys-pct" id="gpu-pct">—</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+</div>
+
+<script>
+  let occChart = null;
+  let lastChartUpdate = 0;
+
+  function fmtTime(ts) {
+    const d = new Date(ts * 1000);
+    return String(d.getHours()).padStart(2,'0') + ':' +
+           String(d.getMinutes()).padStart(2,'0') + ':' +
+           String(d.getSeconds()).padStart(2,'0');
+  }
+
+  function fmtUptime(secs) {
+    if (!secs || secs <= 0) return 'offline';
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    const parts = [];
+    if (h > 0) parts.push(h + 'h');
+    if (m > 0 || h > 0) parts.push(m + 'm');
+    parts.push(s + 's');
+    return parts.join(' ');
+  }
+
+  function barColor(v) {
+    if (v > 80) return 'var(--red)';
+    if (v > 50) return 'var(--amber)';
+    return 'var(--green)';
+  }
+
+  function updatePersonsTags(linked, pending, unknownCount) {
+    const container = document.getElementById('persons-tags');
+    const headerBadge = document.getElementById('header-badge');
+    container.innerHTML = '';
+
+    const total = linked.length + unknownCount;
+    if (total === 0 && pending.length === 0) {
+      container.innerHTML = '<span class="badge badge-empty"><span class="badge-dot" style="background:var(--amber)"></span>No one in view</span>';
+      headerBadge.className = 'badge badge-empty';
+      headerBadge.innerHTML = '<span class="badge-dot" style="background:var(--amber)"></span>No one in view';
+      return;
+    }
+
+    headerBadge.className = 'badge badge-active';
+    headerBadge.innerHTML = '<span class="badge-dot" style="background:var(--green)"></span>' + total + ' in room';
+
+    linked.forEach(name => {
+      const el = document.createElement('span');
+      el.className = 'badge badge-known';
+      el.innerHTML = '<span class="badge-dot" style="background:var(--green)"></span>' + name;
+      container.appendChild(el);
+    });
+    if (unknownCount > 0) {
+      const el = document.createElement('span');
+      el.className = 'badge badge-unknown';
+      el.innerHTML = '<span class="badge-dot" style="background:var(--red)"></span>' + unknownCount + ' unknown';
+      container.appendChild(el);
+    }
+    pending.forEach(name => {
+      const el = document.createElement('span');
+      el.className = 'badge badge-pending';
+      el.innerHTML = '<span class="badge-dot" style="background:var(--amber)"></span>' + name + ' (pending)';
+      container.appendChild(el);
+    });
+  }
+
+  function setCameraStatus(isOnline, camUptime) {
+    const dot   = document.getElementById('cam-dot');
+    const badge = document.getElementById('cam-badge');
+    if (isOnline) {
+      dot.className   = 'status-dot dot-online';
+      badge.className = 'badge badge-online';
+      badge.textContent = 'Online';
+    } else {
+      dot.className   = 'status-dot dot-offline';
+      badge.className = 'badge badge-offline';
+      badge.textContent = 'Offline';
+    }
+  }
+
+  function initChart(labels, totalData, knownData, unknownData) {
+    const ctx = document.getElementById('occChart').getContext('2d');
+    occChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            label: 'Total',
+            data: totalData,
+            borderColor: 'rgba(77,145,230,0.7)',
+            backgroundColor: 'rgba(77,145,230,0.05)',
+            borderWidth: 1.5,
+            borderDash: [5, 4],
+            fill: true, tension: 0, pointRadius: 0
+          },
+          {
+            label: 'Known',
+            data: knownData,
+            borderColor: '#34c97e',
+            backgroundColor: 'rgba(52,201,126,0.10)',
+            borderWidth: 1.5,
+            fill: true, tension: 0, pointRadius: 0
+          },
+          {
+            label: 'Unknown',
+            data: unknownData,
+            borderColor: '#e05252',
+            backgroundColor: 'rgba(224,82,82,0.08)',
+            borderWidth: 1.5,
+            fill: true, tension: 0, pointRadius: 0
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 0 },
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: '#1e2535',
+            titleColor: '#8b91a5',
+            bodyColor: '#e8eaf0',
+            borderColor: 'rgba(255,255,255,0.10)',
+            borderWidth: 1,
+            padding: 10,
+            cornerRadius: 8,
+            callbacks: { label: ctx => ' ' + ctx.dataset.label + ': ' + ctx.parsed.y }
+          }
+        },
+        scales: {
+          x: {
+            display: true,
+            ticks: { color: '#555d72', font: { size: 10, family: "'JetBrains Mono', monospace" }, maxTicksLimit: 8, maxRotation: 0 },
+            grid:  { display: false },
+            border:{ display: false }
+          },
+          y: {
+            min: 0,
+            ticks: { stepSize: 1, color: '#555d72', font: { size: 11, family: "'JetBrains Mono', monospace" } },
+            grid:  { color: 'rgba(255,255,255,0.04)' },
+            border:{ display: false }
+          }
         }
+      }
+    });
+  }
 
-        function fmtUptime(secs) {
-            if (secs === 0) return 'offline';
-            const h = Math.floor(secs / 3600);
-            const m = Math.floor((secs % 3600) / 60);
-            const s = secs % 60;
-            const parts = [];
-            if (h > 0) parts.push(h + 'h');
-            if (m > 0 || h > 0) parts.push(m + 'm');
-            parts.push(s + 's');
-            return parts.join(' ');
+  function fetchData() {
+    fetch('/dashboard/data')
+      .then(r => r.json())
+      .then(d => {
+        const c = d.current;
+
+        // Metrics
+        document.getElementById('people-count').textContent  = c.count;
+        document.getElementById('known-count').textContent   = c.known;
+        document.getElementById('unknown-count').textContent = c.unknown;
+        document.getElementById('uptime-value').textContent  = fmtUptime(d.uptime.gateway);
+
+        // People count color
+        const pcEl = document.getElementById('people-count');
+        pcEl.className = 'metric-value ' + (c.count > 0 ? 'v-green' : 'v-default');
+
+        // Persons bar
+        updatePersonsTags(c.linked, c.pending, c.unknown);
+
+        // Camera status
+        const camOnline = d.uptime.camera > 0;
+        setCameraStatus(camOnline, d.uptime.camera);
+        document.getElementById('uptime-note').textContent = 'Gateway uptime: ' + fmtUptime(d.uptime.gateway);
+
+        // System bars
+        const cpu = Math.round(c.cpu);
+        const gpu = Math.round(c.gpu);
+        document.getElementById('cpu-bar').style.width      = cpu + '%';
+        document.getElementById('cpu-bar').style.background = barColor(cpu);
+        document.getElementById('cpu-pct').textContent      = cpu + '%';
+        document.getElementById('gpu-bar').style.width      = gpu + '%';
+        document.getElementById('gpu-bar').style.background = barColor(gpu);
+        document.getElementById('gpu-pct').textContent      = gpu + '%';
+
+        // Chart — update every 30s to avoid overhead
+        const now = Date.now();
+        if (now - lastChartUpdate >= 30000 || !occChart) {
+          lastChartUpdate = now;
+          const labels      = d.history.map(h => fmtTime(h.t));
+          const totalData   = d.history.map(h => h.count);
+          const knownData   = d.history.map(h => h.known);
+          const unknownData = d.history.map(h => h.unknown);
+          if (!occChart) {
+            initChart(labels, totalData, knownData, unknownData);
+          } else {
+            occChart.data.labels            = labels;
+            occChart.data.datasets[0].data  = totalData;
+            occChart.data.datasets[1].data  = knownData;
+            occChart.data.datasets[2].data  = unknownData;
+            occChart.update('none');
+          }
         }
+      })
+      .catch(() => {});
+  }
 
-        function fetchData() {
-            fetch('/dashboard/data')
-                .then(r => r.json())
-                .then(d => {
-                    document.getElementById('current-count').textContent = d.current.count;
-                    document.getElementById('known-count').textContent = d.current.known;
-                    document.getElementById('unknown-count').textContent = d.current.unknown;
-                    document.getElementById('uptime-gateway').textContent = fmtUptime(d.uptime.gateway);
-                    document.getElementById('uptime-camera').textContent = fmtUptime(d.uptime.camera);
-                    document.getElementById('cpu-val').textContent = Math.round(d.current.cpu) + '%';
-                    document.getElementById('gpu-val').textContent = Math.round(d.current.gpu) + '%';
-
-                    const list = document.getElementById('tracked-list');
-                    list.innerHTML = '';
-
-                    if (d.current.linked.length === 0 && d.current.unknown === 0) {
-                        const tag = document.createElement('span');
-                        tag.className = 'tracked-tag pending';
-                        tag.textContent = 'No one in view';
-                        list.appendChild(tag);
-                    } else {
-                        d.current.linked.forEach(name => {
-                            const tag = document.createElement('span');
-                            tag.className = 'tracked-tag';
-                            tag.textContent = name;
-                            list.appendChild(tag);
-                        });
-                        if (d.current.unknown > 0) {
-                            const tag = document.createElement('span');
-                            tag.className = 'tracked-tag unknown-tag';
-                            tag.textContent = d.current.unknown + ' unknown';
-                            list.appendChild(tag);
-                        }
-                    }
-
-                    d.current.pending.forEach(name => {
-                        const tag = document.createElement('span');
-                        tag.className = 'tracked-tag pending';
-                        tag.textContent = name + ' (pending)';
-                        list.appendChild(tag);
-                    });
-
-                    const now = Date.now();
-                    if (now - lastChartUpdate >= 30000) {
-                        lastChartUpdate = now;
-                        const labels = d.history.map(h => fmtTime(h.t));
-                        const totalData = d.history.map(h => h.count);
-                        const knownData = d.history.map(h => h.known);
-                        const unknownData = d.history.map(h => h.unknown);
-
-                        if (chart) {
-                            chart.data.labels = labels;
-                            chart.data.datasets[0].data = totalData;
-                            chart.data.datasets[1].data = knownData;
-                            chart.data.datasets[2].data = unknownData;
-                            chart.update('none');
-                        } else {
-                            const ctx = document.getElementById('chart-container').getContext('2d');
-                            chart = new Chart(ctx, {
-                                type: 'line',
-                            data: {
-                                labels: labels,
-                                datasets: [
-                                    {
-                                        label: 'Known',
-                                        data: knownData,
-                                        borderColor: '#3fb950',
-                                        backgroundColor: '#3fb95022',
-                                        borderWidth: 2, fill: true, tension: 0.3,
-                                        pointRadius: 1, pointHoverRadius: 5,
-                                    },
-                                    {
-                                        label: 'Unknown',
-                                        data: unknownData,
-                                        borderColor: '#f85149',
-                                        backgroundColor: '#f8514922',
-                                        borderWidth: 2, fill: true, tension: 0.3,
-                                        pointRadius: 1, pointHoverRadius: 5,
-                                    },
-                                    {
-                                        label: 'Total',
-                                        data: totalData,
-                                        borderColor: '#58a6ff',
-                                        backgroundColor: '#1f6feb33',
-                                        borderWidth: 2, fill: false, tension: 0.3,
-                                        pointRadius: 1, pointHoverRadius: 5,
-                                    },
-                                ]
-                            },
-                                options: {
-                                    responsive: true,
-                                    maintainAspectRatio: false,
-                                    scales: {
-                                        x: { ticks: { color: '#8b949e', maxTicksLimit: 16 }, grid: { color: '#21262d' } },
-                                        y: { beginAtZero: true, ticks: { color: '#8b949e', stepSize: 1 },
-                                             stacked: true, grid: { color: '#21262d' } }
-                                    },
-                                    plugins: { legend: { labels: { color: '#c9d1d9' } } }
-                                }
-                        });
-                    }
-                    }
-                })
-                .catch(() => {});
-        }
-
-        fetchData();
-        setInterval(fetchData, 2000);
-    </script>
+  fetchData();
+  setInterval(fetchData, 2000);
+</script>
 </body>
-</html>
-"""
+</html>"""
 
 
 @app.route("/dashboard", methods=["GET"])
@@ -648,40 +880,23 @@ def dashboard():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CATCH-ALL PROXY  (verify RSA → forward everything else to host)
+#  CATCH-ALL PROXY
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 def proxy(path):
-    """
-    Single catch-all route.
-    Any request that passes RSA verification is forwarded to the host.
-
-    Flow:
-      1. Read raw body (used for signature verification)
-      2. Verify RSA signature
-      3. Forward to host with HOST_TOKEN
-      4. Mirror host response back to client
-
-    Adding new host endpoints requires NO changes to gateway.py —
-    just add the route to host.py and the gateway forwards it automatically.
-    """
     full_path = f"/{path}"
+    raw_body = request.get_data(as_text=True)
 
-    # ── GET requests: no body to verify, use path + timestamp + empty string ──
-    raw_body = request.get_data(as_text=True)  # empty string for GET
-
-    # ── Verify RSA signature ──────────────────────────────────────────────────
     device_id, error = verify_request(request, raw_body)
     if error:
         return jsonify({"error": error}), 401
 
-    # ── Forward to host ───────────────────────────────────────────────────────
     return forward_to_host(
         device_id    = device_id,
         path         = full_path,
         method       = request.method,
-        raw_body     = request.get_data(),          # raw bytes for forwarding
+        raw_body     = request.get_data(),
         content_type = request.content_type,
     )
 
@@ -691,6 +906,7 @@ def proxy(path):
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    GATEWAY_START_TIME = time.time()
     if USE_HTTPS:
         cert_file = "gateway.crt"
         key_file  = "gateway.key"
@@ -705,7 +921,7 @@ if __name__ == "__main__":
         ssl_context = None
 
     app.run(
-        host="0.0.0.0",   # bind all interfaces — zeroconf discovers IP automatically
+        host="0.0.0.0",
         port=5100,
         ssl_context=ssl_context,
         debug=False
